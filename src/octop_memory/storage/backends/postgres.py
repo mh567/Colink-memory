@@ -16,6 +16,8 @@ from psycopg.types.json import Jsonb
 
 from octop_memory.domain.datetime import as_utc
 from octop_memory.storage.backends import _UNSET, _Unset
+from octop_memory.storage.backends.forget import AtomForgetStore
+from octop_memory.storage.backends.fts_text import segment_cjk
 from octop_memory.storage.backends.postgres_pool import acquire_pool
 from octop_memory.types import (
     ActiveEntity,
@@ -44,7 +46,20 @@ SHARED_SCHEMA = "octop_memory"
 
 # Version of the shared-table layout, stamped into ``meta``. Bump when the
 # DDL below changes shape and add a corresponding migration.
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "3"
+
+# Keep these character ranges aligned with segment_cjk (the SQLite index and
+# both query paths). Use the C collation for the regex's code point ranges.
+_ATOM_FTS_EXPRESSION = r"""
+    to_tsvector(
+        'simple',
+        regexp_replace(
+            (assertion || ' ' || verbatim_quote || ' ' ||
+             COALESCE(jsonb_path_query_array(search_terms, '$[*]')::text, '')) COLLATE "C",
+            U&'([\3400-\4DBF\4E00-\9FFF\F900-\FAFF])', E' \\1 ', 'g'
+        )
+    )
+"""
 
 # Arbitrary constant identifying "octop-memory DDL" for pg_advisory_xact_lock,
 # so concurrent Memory instances (multiple agents / processes booting at once)
@@ -83,6 +98,13 @@ _TABLES = (
 def _rowcount(value: Any) -> int:
     """Normalize DB-API rowcount values for strict typing."""
     return int(value) if value is not None else 0
+
+
+def _atom_fts_query(query: str) -> tuple[str, str]:
+    segmented = segment_cjk(query) or query
+    if segmented != query:
+        return "phraseto_tsquery('simple', %s)", segmented
+    return "plainto_tsquery('simple', %s)", query
 
 
 class PostgresMemoryBackend:
@@ -303,7 +325,7 @@ class PostgresMemoryBackend:
             # ----------------------------------------------------------
             # M2: L2 Atoms
             # ----------------------------------------------------------
-            cur.execute("""
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS atoms (
                     namespace TEXT NOT NULL,
                     id TEXT NOT NULL,
@@ -320,16 +342,11 @@ class PostgresMemoryBackend:
                     superseded_by TEXT,
                     deprecated_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL,
-                    fts_tsv TSVECTOR GENERATED ALWAYS AS (
-                        to_tsvector(
-                            'simple',
-                            assertion || ' ' || verbatim_quote || ' ' ||
-                            COALESCE(jsonb_path_query_array(search_terms, '$[*]')::text, '')
-                        )
-                    ) STORED,
+                    fts_tsv TSVECTOR GENERATED ALWAYS AS ({_ATOM_FTS_EXPRESSION}) STORED,
                     PRIMARY KEY (namespace, id)
                 )
             """)
+            self._upgrade_atom_fts(cur)
             cur.execute("CREATE INDEX IF NOT EXISTS atoms_entity ON atoms(namespace, entity_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS atoms_importance ON atoms(namespace, importance)")
             cur.execute("CREATE INDEX IF NOT EXISTS atoms_created_at ON atoms(namespace, created_at)")
@@ -387,6 +404,7 @@ class PostgresMemoryBackend:
                     dirty BOOLEAN NOT NULL DEFAULT TRUE,
                     regen_attempt_count INTEGER NOT NULL DEFAULT 0,
                     summary_version INTEGER NOT NULL DEFAULT 0,
+                    mutation_version BIGINT NOT NULL DEFAULT 0,
                     last_regen_at TIMESTAMPTZ,
                     last_user_edit_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL,
@@ -395,6 +413,19 @@ class PostgresMemoryBackend:
                     UNIQUE (namespace, entity_id)
                 )
             """)
+            # Even a no-op ALTER requests ACCESS EXCLUSIVE. Under the
+            # initialization advisory lock, only migrate an absent column
+            # so an ordinary reader cannot block already-migrated stores.
+            cur.execute(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = %s AND table_name = 'entity_pages'
+                     AND column_name = 'mutation_version'""",
+                (SHARED_SCHEMA,),
+            )
+            if cur.fetchone() is None:
+                cur.execute(
+                    "ALTER TABLE entity_pages ADD COLUMN IF NOT EXISTS mutation_version BIGINT NOT NULL DEFAULT 0"
+                )
             cur.execute("CREATE INDEX IF NOT EXISTS entity_pages_dirty ON entity_pages(namespace, dirty)")
             cur.execute("CREATE INDEX IF NOT EXISTS entity_pages_updated ON entity_pages(namespace, updated_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS entity_pages_last_regen ON entity_pages(namespace, last_regen_at)")
@@ -522,6 +553,23 @@ class PostgresMemoryBackend:
         # shared schema for this connection's lifetime.
         self._conn.execute(f"SET search_path TO {SHARED_SCHEMA}, public")
         self._conn.commit()
+
+    def _upgrade_atom_fts(self, cur: Any) -> None:
+        # Replace the old generated column to reindex existing atoms. The caller
+        # holds the DDL advisory lock and recreates its GIN indexes afterward.
+        cur.execute(
+            """SELECT generation_expression FROM information_schema.columns
+               WHERE table_schema = %s AND table_name = 'atoms' AND column_name = 'fts_tsv'""",
+            (SHARED_SCHEMA,),
+        )
+        row = cur.fetchone()
+        if row is not None and "regexp_replace" in (row["generation_expression"] or ""):
+            return
+        cur.execute(f"""
+            ALTER TABLE atoms
+                DROP COLUMN IF EXISTS fts_tsv,
+                ADD COLUMN fts_tsv TSVECTOR GENERATED ALWAYS AS ({_ATOM_FTS_EXPRESSION}) STORED
+        """)
 
     def _scope_fts_indexes_by_namespace(self, cur: Any) -> None:
         """Replace single-column FTS indexes with ``(namespace, tsv)`` ones.
@@ -899,17 +947,18 @@ class PostgresMemoryBackend:
         return True
 
     def search_memories(self, query: str, limit: int = 5) -> list[MemoryNode]:
+        tsquery, search_terms = _atom_fts_query(query)
         with self._cursor() as cur:
             cur.execute(
-                """SELECT n.*, a.assertion AS atom_content
+                f"""SELECT n.*, a.assertion AS atom_content
                     FROM atoms a
                     JOIN memory_nodes n ON n.namespace = a.namespace AND n.atom_id = a.id
                     WHERE a.namespace = %s
-                      AND a.fts_tsv @@ plainto_tsquery('simple', %s)
+                      AND a.fts_tsv @@ {tsquery}
                       AND a.deprecated_at IS NULL
-                    ORDER BY ts_rank(a.fts_tsv, plainto_tsquery('simple', %s)) DESC
+                    ORDER BY ts_rank(a.fts_tsv, {tsquery}) DESC
                     LIMIT %s""",
-                (self._ns, query, query, limit),
+                (self._ns, search_terms, search_terms, limit),
             )
             rows = cur.fetchall()
         return [self._row_to_node(r) for r in rows]
@@ -1347,23 +1396,38 @@ class PostgresMemoryBackend:
             count = _rowcount(cur.rowcount)
         return count > 0
 
+    def atom_forget_ids(self, atom_id: str) -> tuple[str, ...]:
+        with self._cursor() as cur:
+            store = AtomForgetStore(cur.execute, self._ns, postgres_schema=SHARED_SCHEMA)
+            ids, _ = store.history(atom_id)
+            return ids
+
+    def forget_atom(self, atom_id: str) -> tuple[str, ...]:
+        with self.transaction(), self._cursor() as cur:
+            return AtomForgetStore(cur.execute, self._ns, postgres_schema=SHARED_SCHEMA).forget(atom_id)
+
     def search_atoms(
         self,
         query: str,
         *,
+        entity_id: str | None = None,
         include_deprecated: bool = False,
         limit: int = 10,
     ) -> list[AtomCard]:
+        tsquery, search_terms = _atom_fts_query(query)
         deprecation_filter = "" if include_deprecated else "AND deprecated_at IS NULL"
+        entity_filter = "" if entity_id is None else "AND entity_id = %s"
+        scope_params = (self._ns, search_terms) if entity_id is None else (self._ns, search_terms, entity_id)
         with self._cursor() as cur:
             cur.execute(
                 f"""SELECT * FROM atoms
                     WHERE namespace = %s
-                      AND fts_tsv @@ plainto_tsquery('simple', %s)
+                      AND fts_tsv @@ {tsquery}
                       {deprecation_filter}
-                    ORDER BY ts_rank(fts_tsv, plainto_tsquery('simple', %s)) DESC
+                      {entity_filter}
+                    ORDER BY ts_rank(fts_tsv, {tsquery}) DESC
                     LIMIT %s""",
-                (self._ns, query, query, limit),
+                (*scope_params, search_terms, limit),
             )
             rows = cur.fetchall()
         return [self._row_to_atom(r) for r in rows]
@@ -1682,6 +1746,7 @@ class PostgresMemoryBackend:
                         dirty = EXCLUDED.dirty,
                         regen_attempt_count = EXCLUDED.regen_attempt_count,
                         summary_version = EXCLUDED.summary_version,
+                        mutation_version = entity_pages.mutation_version + 1,
                         last_regen_at = EXCLUDED.last_regen_at,
                         last_user_edit_at = EXCLUDED.last_user_edit_at,
                         updated_at = EXCLUDED.updated_at
@@ -1747,14 +1812,7 @@ class PostgresMemoryBackend:
     def mark_entity_page_dirty(self, entity_id: str, *, when: datetime) -> None:
         with self._cursor() as cur:
             cur.execute(
-                """UPDATE entity_pages
-                    SET dirty = TRUE, updated_at = %s
-                    WHERE namespace = %s AND entity_id = %s""",
-                (when, self._ns, entity_id),
-            )
-            if _rowcount(cur.rowcount) == 0:
-                cur.execute(
-                    """INSERT INTO entity_pages
+                """INSERT INTO entity_pages
                         (namespace, id, entity_id, summary_markdown, headline, topics,
                          dirty, regen_attempt_count, summary_version,
                          last_regen_at, last_user_edit_at,
@@ -1762,17 +1820,11 @@ class PostgresMemoryBackend:
                         VALUES (%s, %s, %s, '', '', %s, TRUE, 0, 0, NULL, NULL, %s, %s)
                         ON CONFLICT (namespace, entity_id) DO UPDATE SET
                             dirty = TRUE,
+                            mutation_version = entity_pages.mutation_version + 1,
                             updated_at = EXCLUDED.updated_at
                     """,
-                    (
-                        self._ns,
-                        f"page_{entity_id}",
-                        entity_id,
-                        Jsonb([]),
-                        when,
-                        when,
-                    ),
-                )
+                (self._ns, f"page_{entity_id}", entity_id, Jsonb([]), when, when),
+            )
 
     def apply_entity_page_regen(
         self,
@@ -1782,6 +1834,7 @@ class PostgresMemoryBackend:
         headline: str,
         topics: list[str],
         when: datetime,
+        expected_mutation_version: int | None = None,
     ) -> bool:
         with self._cursor() as cur:
             cur.execute(
@@ -1792,9 +1845,11 @@ class PostgresMemoryBackend:
                         dirty = FALSE,
                         regen_attempt_count = 0,
                         summary_version = summary_version + 1,
+                        mutation_version = mutation_version + 1,
                         last_regen_at = %s,
                         updated_at = %s
-                    WHERE namespace = %s AND entity_id = %s""",
+                    WHERE namespace = %s AND entity_id = %s
+                      AND (%s::bigint IS NULL OR mutation_version = %s)""",
                 (
                     summary_markdown,
                     headline,
@@ -1803,6 +1858,8 @@ class PostgresMemoryBackend:
                     when,
                     self._ns,
                     entity_id,
+                    expected_mutation_version,
+                    expected_mutation_version,
                 ),
             )
             count = _rowcount(cur.rowcount)
@@ -1813,6 +1870,7 @@ class PostgresMemoryBackend:
         entity_id: str,
         *,
         when: datetime,
+        expected_mutation_version: int | None = None,
     ) -> bool:
         with self._cursor() as cur:
             cur.execute(
@@ -1820,8 +1878,9 @@ class PostgresMemoryBackend:
                     SET regen_attempt_count = regen_attempt_count + 1,
                         dirty = TRUE,
                         updated_at = %s
-                    WHERE namespace = %s AND entity_id = %s""",
-                (when, self._ns, entity_id),
+                    WHERE namespace = %s AND entity_id = %s
+                      AND (%s::bigint IS NULL OR mutation_version = %s)""",
+                (when, self._ns, entity_id, expected_mutation_version, expected_mutation_version),
             )
             count = _rowcount(cur.rowcount)
         return count > 0
@@ -1838,6 +1897,7 @@ class PostgresMemoryBackend:
                 """UPDATE entity_pages
                     SET summary_markdown = %s,
                         summary_version = summary_version + 1,
+                        mutation_version = mutation_version + 1,
                         last_user_edit_at = %s,
                         updated_at = %s
                     WHERE namespace = %s AND entity_id = %s""",
@@ -2350,6 +2410,7 @@ class PostgresMemoryBackend:
             dirty=bool(row["dirty"]),
             regen_attempt_count=int(row.get("regen_attempt_count") or 0),
             summary_version=int(row.get("summary_version") or 0),
+            mutation_version=int(row["mutation_version"]),
             last_regen_at=row.get("last_regen_at"),
             last_user_edit_at=row.get("last_user_edit_at"),
             created_at=row["created_at"],

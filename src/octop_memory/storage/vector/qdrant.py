@@ -176,13 +176,10 @@ class QdrantVectorIndex:
 
     def delete(self, atom_id: str) -> None:
         """Delete a single vector record."""
-        try:
-            self._client.delete(
-                collection_name=self._collection_name,
-                points_selector=qmodels.PointIdsList(points=[atom_id]),
-            )
-        except VECTOR_ERRORS:
-            logger.warning("qdrant delete failed for %s", atom_id, exc_info=True)
+        self._client.delete(
+            collection_name=self._collection_name,
+            points_selector=qmodels.PointIdsList(points=[atom_id]),
+        )
 
     # ------------------------------------------------------------------
     # Convenience properties

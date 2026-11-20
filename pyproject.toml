@@ -3,8 +3,8 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "octop-memory"
-version = "1.0.2"
+name = "colink-memory"
+version = "1.0.3.post1"
 description = "Pluggable memory system with hierarchical recall, FTS search, and multiple backend support."
 readme = "README.md"
 license = { text = "MIT" }
@@ -79,10 +79,10 @@ octop-memory = "octop_memory.adapters.cli:main"
 octopmemory-bridge = "octop_memory.adapters.bridge.server:main"
 
 [project.urls]
-Homepage = "https://github.com/TencentCloud/octop-memory"
-Repository = "https://github.com/TencentCloud/octop-memory"
-Issues = "https://github.com/TencentCloud/octop-memory/issues"
-Changelog = "https://github.com/TencentCloud/octop-memory/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/mh567/Colink-memory"
+Repository = "https://github.com/mh567/Colink-memory"
+Issues = "https://github.com/mh567/Colink-memory/issues"
+Changelog = "https://github.com/mh567/Colink-memory/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/octop_memory"]

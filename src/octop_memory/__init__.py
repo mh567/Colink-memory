@@ -21,7 +21,7 @@ except ImportError:
     try:
         from importlib.metadata import PackageNotFoundError, version
 
-        __version__ = version("octop-memory")
+        __version__ = version("colink-memory")
     except PackageNotFoundError:
         # Source checkout without an installed distribution.
         __version__ = "0.0.0+unknown"
