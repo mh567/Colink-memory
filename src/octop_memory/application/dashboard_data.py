@@ -16,8 +16,8 @@ All handlers follow the same shape as ``Bridge`` methods:
 
 so they can be attached straight into ``Bridge._dispatch`` and reuse
 ``Bridge.handle``'s exception → JSON-RPC translation. Heavy filtering
-that ``Memory`` doesn't natively support (``kind`` join, ``query``
-substring match, ``intensity_min`` / ``topic`` for episodes) is done
+that ``Memory`` doesn't natively support (``kind`` join, substring
+matching on other layers, ``intensity_min`` / ``topic`` for episodes) is done
 in Python after fetching a wider window — acceptable for an MVP
 dashboard that runs against per-agent SQLite stores in the low
 thousands of rows.
@@ -30,9 +30,10 @@ import uuid
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from octop_memory.domain.datetime import as_utc
+from octop_memory.pipeline.recall.rerank import from_atom, rerank
 from octop_memory.types import (
     AtomCard,
     JournalEntry,
@@ -137,7 +138,7 @@ def _paginate(items: list[Any], offset: int, limit: int) -> tuple[list[Any], int
     """Slice a Python list into a (window, total_seen, has_more) tuple.
 
     ``total_seen`` is just ``len(items)`` — the caller already fetched
-    a wide window from SQLite, so this is a true count of what we
+    a bounded window from storage, so this is a true count of what we
     surveyed (NOT the count of all rows in the table). The frontend
     treats it as "≥ N", which is good enough for paging UI.
     """
@@ -194,38 +195,37 @@ def list_atoms(memory: Memory, params: dict[str, Any]) -> dict[str, Any]:
         candidate_type?: "Fact" | "Decision" | "Task" | "Preference" | "ConflictCandidate"
         importance_min?: "low" | "medium" | "high"
         include_deprecated?: bool      (default false)
-        query?: str                    (substring over assertion + verbatim_quote + search_terms)
-        order_by?: "created_at" | "occurred_at" | "importance"   (default "created_at")
+        query?: str                    (full-text over assertion + verbatim_quote + search_terms)
+        order_by?: "created_at" | "occurred_at" | "importance"
         order?: "asc" | "desc"          (default "desc")
         offset?: int                    (default 0)
         limit?: int                     (default 50, cap 500)
 
     Returns ``{items, total, has_more}`` where ``items`` are
-    JSON-serializable AtomCard dicts (datetime → ISO 8601).
+    JSON-serializable AtomCard dicts (datetime → ISO 8601). Without
+    explicit ordering, search hits are ranked by relevance; a plain
+    listing is ordered newest-first. Totals describe the bounded
+    candidate window (up to 10,000 indexed matches for a search).
     """
     entity_id = _opt_str(params, "entity_id")
     candidate_type = _opt_str(params, "candidate_type")
     importance_min = _opt_str(params, "importance_min")
     include_deprecated = bool(params.get("include_deprecated", False))
     query = _opt_str(params, "query")
-    order_by = _opt_str(params, "order_by") or "created_at"
-    order = (_opt_str(params, "order") or "desc").lower()
+    requested_order = _opt_str(params, "order")
+    order_by = _opt_str(params, "order_by")
+    order = (requested_order or "desc").lower()
     if order not in {"asc", "desc"}:
         raise ValueError("'order': must be 'asc' or 'desc'")
-    if order_by not in {"created_at", "occurred_at", "importance"}:
+    if order_by is not None and order_by not in {"created_at", "occurred_at", "importance"}:
         raise ValueError("'order_by': must be 'created_at' / 'occurred_at' / 'importance'")
     offset = _offset(params)
     limit = _limit(params)
 
-    # Pull a wide window — Memory.list_atoms doesn't paginate yet, and
-    # for MVP the per-agent atom count is in the low thousands. We
-    # filter / sort in Python.
-    atoms = memory.list_atoms(
-        entity_id=entity_id,
-        importance=None,  # we filter via importance_min below
-        include_deprecated=include_deprecated,
-        limit=10_000,
-    )
+    if query is None:
+        atoms = memory.list_atoms(entity_id=entity_id, include_deprecated=include_deprecated, limit=10_000)
+    else:
+        atoms = memory.search_atoms(query, entity_id=entity_id, include_deprecated=include_deprecated, limit=10_000)
 
     kind_cache: dict[str, str | None] = {}
 
@@ -238,19 +238,12 @@ def list_atoms(memory: Memory, params: dict[str, Any]) -> dict[str, Any]:
     if candidate_type is not None:
         atoms = [a for a in atoms if _atom_kind(memory, a, kind_cache) == candidate_type]
 
-    if query is not None:
-        atoms = [
-            a
-            for a in atoms
-            if _matches_query(
-                [a.assertion, a.verbatim_quote, " ".join(a.search_terms or [])],
-                query,
-            )
-        ]
-
     # Stable, deterministic ordering:
     reverse = order == "desc"
-    if order_by == "importance":
+    if query is not None and order_by is None and requested_order is None:
+        ranked = rerank([from_atom(atom, rank_index=i) for i, atom in enumerate(atoms)])
+        atoms = [cast(AtomCard, hit.candidate.raw_payload) for hit in ranked]
+    elif order_by == "importance":
         atoms.sort(
             key=lambda a: (
                 _IMPORTANCE_RANK.get(a.importance, 0),

@@ -9,6 +9,7 @@
 | 宿主文件 glob / Windows 路径 | `uv run pytest tests/test_bridge_host_files.py tests/test_portable_sources.py -q`；PureWindowsPath 用例在任意平台检查 rooted / drive-relative / UNC 拒绝，portable fixture 按 Path.parts 隔离用户目录 |
 | Memory / runtime | `uv run pytest tests/test_core.py tests/test_service.py -q` |
 | 召回 | `uv run pytest tests/test_recall_pipeline.py tests/test_recall_multi_source.py tests/test_recall_risk_fixes.py -q` |
+| Dashboard Atom 查询 / 中文全文索引升级 | 设专用 `TEST_POSTGRES_DSN`，执行 `uv run pytest tests/test_backend_parity.py tests/test_bridge_dashboard.py tests/test_fts_cjk.py -k 'AtomSearch or adjacent_chinese or atom_fts_upgrade or filter_by_query' -q -rs`；两种后端共测旧记录召回、过滤与分页、中文短语及树形查找；真实 PG 重开升级前的库，确认旧 Atom 重建索引后可查。 |
 | 提炼 | `uv run pytest tests/test_extractor.py tests/test_promotion.py -q` |
 | 运行报错隔离 / 存量治理 | `uv run pytest tests/test_runtime_error_retention.py tests/test_bridge_server.py tests/test_backend_parity.py -q -rs`；真实 PG 验证仅结构化标记过滤、未知来源只列审核清单、任意措辞手动保存、无短句意图例外、raw fallback、晋升、人工保护、幂等和事务回滚 |
 | 手动文档治理 | `uv run pytest tests/test_manual_documents.py tests/test_backend_parity.py -q -rs`；真实专用 PG 的 `-k ManualDocument` 与 SQLite 同组验证冲突/替代候选、原证据保留、raw fallback、快照去重、幂等与回滚；单测覆盖伪造/不确定证据、过期采纳、缓存失效、分批续查、save/自动晋升钩子 |
@@ -16,6 +17,7 @@
 | Harness 后台审核契约 | 安装 CI 固定提交的真实 octop-harness 后，`uv run --no-sync pytest tests/test_backend_parity.py -k HarnessManualReview -q -rs`；SQLite/真实 PG 同组验证保存回调、维护拍、冲突软停用及证据、阻塞模型不阻塞 save、20 条批次与续查。真实 Service / Middleware / 后台线程，只替换模型响应 |
 | 宿主失败来源边界 | 在 octop-harness 运行 `pytest tests/test_model_retry_middleware.py tests/test_memory_middleware.py tests/test_teams/test_inbox.py`：真实图 checkpoint error / 恢复、零错误 raw 写入、团队自动通知排除；WebUI / IM / 团队失败展示在 Octop 测试 |
 | 写入 / backend | `uv run pytest tests/test_memory_atom_write.py tests/test_backend_parity.py -q -rs` |
+| 永久遗忘 | `uv run pytest tests/test_memory_atom_write.py -k TestForgetAtom -q -rs`；SQLite 和真实 PostgreSQL 验证历史前身、共享证据、日记和汇总、实体别名和页面、命名空间隔离、失败回滚、搜索消失与应用日志无正文 |
 | EntityPage 并发 / 修订迁移 | `uv run pytest tests/test_core.py tests/test_sqlite.py tests/test_page_regen.py tests/test_entity_page_schema.py tests/test_page_user_notes.py tests/test_page_trigger.py tests/test_backend_parity.py tests/test_postgres.py -q -rs`；设置专用 `TEST_POSTGRES_DSN`，`-k PageRegenerationConcurrency` 同组验证用户编辑/Atom dirty/并发生成/upsert、成功/失败两种完成顺序、同时间戳失效、双连接提交及旧列迁移；`-k 'LegacyPageBackend or ConcurrentPageRevisionMigration or PageRevisionBootstrap'` 验证旧签名、不降级条件、四连接迁移及 PG 读事务下打开已迁移库 |
 | 连接 / 事务 / fd | `uv run pytest tests/test_sqlite.py tests/test_fd_pressure.py tests/test_postgres_pool.py tests/test_backend_parity.py -q -rs`；设置专用 `TEST_POSTGRES_DSN`，确认 PG 用例实际运行 |
 | 向量接口 / 可选 index | `uv run pytest tests/test_vector_chroma.py -q`；使用 mock index 和 `tmp_path` 数据库，不访问默认数据目录 |

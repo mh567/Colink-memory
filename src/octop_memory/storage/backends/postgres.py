@@ -16,6 +16,8 @@ from psycopg.types.json import Jsonb
 
 from octop_memory.domain.datetime import as_utc
 from octop_memory.storage.backends import _UNSET, _Unset
+from octop_memory.storage.backends.forget import AtomForgetStore
+from octop_memory.storage.backends.fts_text import segment_cjk
 from octop_memory.storage.backends.postgres_pool import acquire_pool
 from octop_memory.types import (
     ActiveEntity,
@@ -44,7 +46,20 @@ SHARED_SCHEMA = "octop_memory"
 
 # Version of the shared-table layout, stamped into ``meta``. Bump when the
 # DDL below changes shape and add a corresponding migration.
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+
+# Keep these character ranges aligned with segment_cjk (the SQLite index and
+# both query paths). Use the C collation for the regex's code point ranges.
+_ATOM_FTS_EXPRESSION = r"""
+    to_tsvector(
+        'simple',
+        regexp_replace(
+            (assertion || ' ' || verbatim_quote || ' ' ||
+             COALESCE(jsonb_path_query_array(search_terms, '$[*]')::text, '')) COLLATE "C",
+            U&'([\3400-\4DBF\4E00-\9FFF\F900-\FAFF])', E' \\1 ', 'g'
+        )
+    )
+"""
 
 # Arbitrary constant identifying "octop-memory DDL" for pg_advisory_xact_lock,
 # so concurrent Memory instances (multiple agents / processes booting at once)
@@ -83,6 +98,13 @@ _TABLES = (
 def _rowcount(value: Any) -> int:
     """Normalize DB-API rowcount values for strict typing."""
     return int(value) if value is not None else 0
+
+
+def _atom_fts_query(query: str) -> tuple[str, str]:
+    segmented = segment_cjk(query) or query
+    if segmented != query:
+        return "phraseto_tsquery('simple', %s)", segmented
+    return "plainto_tsquery('simple', %s)", query
 
 
 class PostgresMemoryBackend:
@@ -303,7 +325,7 @@ class PostgresMemoryBackend:
             # ----------------------------------------------------------
             # M2: L2 Atoms
             # ----------------------------------------------------------
-            cur.execute("""
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS atoms (
                     namespace TEXT NOT NULL,
                     id TEXT NOT NULL,
@@ -320,16 +342,11 @@ class PostgresMemoryBackend:
                     superseded_by TEXT,
                     deprecated_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL,
-                    fts_tsv TSVECTOR GENERATED ALWAYS AS (
-                        to_tsvector(
-                            'simple',
-                            assertion || ' ' || verbatim_quote || ' ' ||
-                            COALESCE(jsonb_path_query_array(search_terms, '$[*]')::text, '')
-                        )
-                    ) STORED,
+                    fts_tsv TSVECTOR GENERATED ALWAYS AS ({_ATOM_FTS_EXPRESSION}) STORED,
                     PRIMARY KEY (namespace, id)
                 )
             """)
+            self._upgrade_atom_fts(cur)
             cur.execute("CREATE INDEX IF NOT EXISTS atoms_entity ON atoms(namespace, entity_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS atoms_importance ON atoms(namespace, importance)")
             cur.execute("CREATE INDEX IF NOT EXISTS atoms_created_at ON atoms(namespace, created_at)")
@@ -536,6 +553,23 @@ class PostgresMemoryBackend:
         # shared schema for this connection's lifetime.
         self._conn.execute(f"SET search_path TO {SHARED_SCHEMA}, public")
         self._conn.commit()
+
+    def _upgrade_atom_fts(self, cur: Any) -> None:
+        # Replace the old generated column to reindex existing atoms. The caller
+        # holds the DDL advisory lock and recreates its GIN indexes afterward.
+        cur.execute(
+            """SELECT generation_expression FROM information_schema.columns
+               WHERE table_schema = %s AND table_name = 'atoms' AND column_name = 'fts_tsv'""",
+            (SHARED_SCHEMA,),
+        )
+        row = cur.fetchone()
+        if row is not None and "regexp_replace" in (row["generation_expression"] or ""):
+            return
+        cur.execute(f"""
+            ALTER TABLE atoms
+                DROP COLUMN IF EXISTS fts_tsv,
+                ADD COLUMN fts_tsv TSVECTOR GENERATED ALWAYS AS ({_ATOM_FTS_EXPRESSION}) STORED
+        """)
 
     def _scope_fts_indexes_by_namespace(self, cur: Any) -> None:
         """Replace single-column FTS indexes with ``(namespace, tsv)`` ones.
@@ -913,17 +947,18 @@ class PostgresMemoryBackend:
         return True
 
     def search_memories(self, query: str, limit: int = 5) -> list[MemoryNode]:
+        tsquery, search_terms = _atom_fts_query(query)
         with self._cursor() as cur:
             cur.execute(
-                """SELECT n.*, a.assertion AS atom_content
+                f"""SELECT n.*, a.assertion AS atom_content
                     FROM atoms a
                     JOIN memory_nodes n ON n.namespace = a.namespace AND n.atom_id = a.id
                     WHERE a.namespace = %s
-                      AND a.fts_tsv @@ plainto_tsquery('simple', %s)
+                      AND a.fts_tsv @@ {tsquery}
                       AND a.deprecated_at IS NULL
-                    ORDER BY ts_rank(a.fts_tsv, plainto_tsquery('simple', %s)) DESC
+                    ORDER BY ts_rank(a.fts_tsv, {tsquery}) DESC
                     LIMIT %s""",
-                (self._ns, query, query, limit),
+                (self._ns, search_terms, search_terms, limit),
             )
             rows = cur.fetchall()
         return [self._row_to_node(r) for r in rows]
@@ -1361,23 +1396,38 @@ class PostgresMemoryBackend:
             count = _rowcount(cur.rowcount)
         return count > 0
 
+    def atom_forget_ids(self, atom_id: str) -> tuple[str, ...]:
+        with self._cursor() as cur:
+            store = AtomForgetStore(cur.execute, self._ns, postgres_schema=SHARED_SCHEMA)
+            ids, _ = store.history(atom_id)
+            return ids
+
+    def forget_atom(self, atom_id: str) -> tuple[str, ...]:
+        with self.transaction(), self._cursor() as cur:
+            return AtomForgetStore(cur.execute, self._ns, postgres_schema=SHARED_SCHEMA).forget(atom_id)
+
     def search_atoms(
         self,
         query: str,
         *,
+        entity_id: str | None = None,
         include_deprecated: bool = False,
         limit: int = 10,
     ) -> list[AtomCard]:
+        tsquery, search_terms = _atom_fts_query(query)
         deprecation_filter = "" if include_deprecated else "AND deprecated_at IS NULL"
+        entity_filter = "" if entity_id is None else "AND entity_id = %s"
+        scope_params = (self._ns, search_terms) if entity_id is None else (self._ns, search_terms, entity_id)
         with self._cursor() as cur:
             cur.execute(
                 f"""SELECT * FROM atoms
                     WHERE namespace = %s
-                      AND fts_tsv @@ plainto_tsquery('simple', %s)
+                      AND fts_tsv @@ {tsquery}
                       {deprecation_filter}
-                    ORDER BY ts_rank(fts_tsv, plainto_tsquery('simple', %s)) DESC
+                      {entity_filter}
+                    ORDER BY ts_rank(fts_tsv, {tsquery}) DESC
                     LIMIT %s""",
-                (self._ns, query, query, limit),
+                (*scope_params, search_terms, limit),
             )
             rows = cur.fetchall()
         return [self._row_to_atom(r) for r in rows]

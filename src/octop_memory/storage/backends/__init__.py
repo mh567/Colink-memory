@@ -272,6 +272,14 @@ class MemoryBackend(Protocol):
         """
         ...
 
+    def atom_forget_ids(self, atom_id: str) -> tuple[str, ...]:
+        """Return the target and all predecessors in this namespace."""
+        ...
+
+    def forget_atom(self, atom_id: str) -> tuple[str, ...]:
+        """Remove an atom's lineage and provenance; return the removed IDs."""
+        ...
+
     def find_atom_by_signature(self, signature: str) -> AtomCard | None:
         """Look up an atom by its assertion signature hash."""
         ...
@@ -280,10 +288,11 @@ class MemoryBackend(Protocol):
         self,
         query: str,
         *,
+        entity_id: str | None = None,
         include_deprecated: bool = False,
         limit: int = 10,
     ) -> list[AtomCard]:
-        """FTS over assertion + verbatim_quote + search_terms."""
+        """FTS over assertion + verbatim_quote + search_terms, optionally within one entity."""
         ...
 
     def search_atoms_by_time_range(

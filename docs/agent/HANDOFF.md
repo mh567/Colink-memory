@@ -16,6 +16,12 @@
 
 ## 当前任务
 
+### 单条事实永久遗忘
+
+- **实现**：`Memory.atom_forget_ids` 返回目标和历史前身，供宿主写入备份之外的删除记录；`Memory.forget_atom` 在 SQLite / PostgreSQL 事务内删除关联的原始证据、记录和派生内容，保留其他事实。遗忘接口本身不改 schema。新事实写入日志仅记录 ID。
+- **验证**：`make lint typecheck` 通过；专用 PostgreSQL 16 与 SQLite 的 `pytest -q -rs` 全量 1631 通过、3 跳过（两项需 Hermes 源码，一项需 Linux `/proc`）。遗忘专项 16 项通过；真实外部向量服务未运行。
+- **接续**：恢复后在召回前重放，执行期间暂停记忆写入，重放后清理宿主缓存。不替代会话、导出、旧备份、既有应用日志或介质级清理，见 [外部 Agent 集成指南](../integrations.md)。
+
 ### 手动文档审计旧进度升级（PR #33）
 
 - **状态 / 链接**：修复、双后端验证及完整门禁通过，待 PR CI / 维护者复审；[PR #33](https://github.com/TencentCloud/octop-memory/pull/33)。

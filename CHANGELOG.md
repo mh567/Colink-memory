@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3.post1] - 2026-11-20
+
+### 修复
+
+- 支持彻底遗忘指定记忆及其派生记录，同时清理来源引用和搜索索引。SQLite 与 PostgreSQL 行为保持一致。
+
 ## [1.0.3] - 2026-11-04
 
 ### 修复

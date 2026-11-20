@@ -91,6 +91,10 @@ octop-harness 主路径使用 `on_failure="error"`，失败写入 checkpoint tas
 `root → branch → leaf` 是组织树，leaf 用 `atom_id` 投影事实正文，不复制第二份事实。
 人工 correction 创建 successor、active-only supersede 旧 atom 并写 `user_edit` journal；
 不伪造新对话证据。page regeneration 保护 `## My Notes`，绝对事件时间统一为 aware UTC。
+人工遗忘通过 `Memory.atom_forget_ids` 暴露目标及前身 ID，通过 `Memory.forget_atom` 调用
+`storage/backends/forget.py` 在 SQLite / PostgreSQL 事务内删除已知关联证据和派生内容。
+共享来源的其他事实保留其断言；受影响的实体页面整体清空（包括用户笔记）并失效。
+备份外的 ID 记录及恢复重放由宿主负责。
 页面另有 storage 管理的 `mutation_version`：正文 upsert、dirty 失效、人工编辑及生成成功时推进；
 `summary_version` 仍只表示正文生成/编辑版本。regenerator 在读取 Atom 前取得页面修订号，
 成功与失败写回均使用 backend 条件 UPDATE；旧快照返回 `stale_snapshot` 或保留原失败原因，

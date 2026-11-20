@@ -16,6 +16,7 @@ from typing import Any, Concatenate
 
 from octop_memory.domain.datetime import as_utc, parse_datetime_utc
 from octop_memory.storage.backends import _UNSET, _Unset
+from octop_memory.storage.backends.forget import AtomForgetStore
 from octop_memory.storage.backends.fts_text import (
     FTS_TEXT_VERSION,
     fts_match_phrase,
@@ -1353,6 +1354,16 @@ class SqliteMemoryBackend:
         return cur.rowcount > 0
 
     @locked_sqlite_operation
+    def atom_forget_ids(self, atom_id: str) -> tuple[str, ...]:
+        store = AtomForgetStore(self._conn.execute, self._ns)
+        ids, _ = store.history(atom_id)
+        return ids
+
+    def forget_atom(self, atom_id: str) -> tuple[str, ...]:
+        with self.transaction():
+            return AtomForgetStore(self._conn.execute, self._ns).forget(atom_id)
+
+    @locked_sqlite_operation
     def find_atom_by_signature(self, sig: str) -> AtomCard | None:
         """Globally find the first non-deprecated atom whose assertion signature matches ``sig``.
 
@@ -1463,6 +1474,7 @@ class SqliteMemoryBackend:
         self,
         query: str,
         *,
+        entity_id: str | None = None,
         include_deprecated: bool = False,
         limit: int = 10,
     ) -> list[AtomCard]:
@@ -1470,14 +1482,17 @@ class SqliteMemoryBackend:
         ns = self._ns
         safe_query = fts_match_phrase(query)
         deprecation_filter = "" if include_deprecated else "AND a.deprecated_at IS NULL"
+        entity_filter = "" if entity_id is None else "AND a.entity_id = ?"
+        params = (safe_query, limit) if entity_id is None else (safe_query, entity_id, limit)
         rows = self._conn.execute(
             f"""SELECT a.* FROM {ns}_atoms_fts f
                 JOIN {ns}_atoms a ON f.rowid = a.rowid
                 WHERE f.{ns}_atoms_fts MATCH ?
                   {deprecation_filter}
+                  {entity_filter}
                 ORDER BY rank
                 LIMIT ?""",
-            (safe_query, limit),
+            params,
         ).fetchall()
         return [self._row_to_atom(r) for r in rows]
 

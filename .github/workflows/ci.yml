@@ -57,6 +57,9 @@ jobs:
         run: make test
 
       - name: Test real Harness background review
+        env:
+          # The upstream harness also installs octop-memory. Exercise this fork.
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
           # Pin the host containing the asynchronous review scheduler (Harness #110).
           uv pip install "octop-harness @ git+https://github.com/TencentCloud/octop-harness.git@84c19536dec83a5d36e3c17a18f2df8f71c0f65e"

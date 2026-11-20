@@ -29,6 +29,8 @@ from typing import Any
 
 import pytest
 
+from octop_memory import Memory
+from octop_memory.adapters.bridge.handlers import Bridge
 from octop_memory.domain.alias import normalize_alias
 from octop_memory.storage.backends.sqlite import SqliteMemoryBackend
 from octop_memory.types import (
@@ -1070,6 +1072,119 @@ class TestCandidateParity:
 # ---------------------------------------------------------------------------
 
 
+class TestDashboardAtomSearch:
+    @staticmethod
+    def _list_atoms(bridge: Bridge, **params: Any) -> dict[str, Any]:
+        response = bridge.handle({"jsonrpc": "2.0", "id": 1, "method": "list_atoms", "params": params})
+        assert "error" not in response, response
+        return response["result"]
+
+    def test_query_reaches_beyond_newest_unrelated_atoms(self, backend: Any) -> None:
+        bridge = Bridge(Memory(namespace="dashboard", backend=backend))
+        older = _now() - timedelta(days=40)
+        with backend.transaction():
+            backend.save_atom(
+                _make_atom(id="older-match", assertion="喜欢喝美式咖啡", search_terms=["topicmarker"], created_at=older)
+            )
+            for i in range(10_001):
+                backend.save_atom(
+                    _make_atom(id=f"newer-{i}", entity_id="other", assertion="topicmarker topicmarker topicmarker")
+                )
+
+        assert self._list_atoms(bridge, limit=1)["items"][0]["id"] != "older-match"
+        result = self._list_atoms(bridge, query="美式")
+        assert [atom["id"] for atom in result["items"]] == ["older-match"]
+        assert result["total"] == 1
+        assert result["has_more"] is False
+        scoped = self._list_atoms(bridge, query="topicmarker", entity_id="ent-1")
+        assert [atom["id"] for atom in scoped["items"]] == ["older-match"]
+
+    def test_query_reranks_and_preserves_filters_sort_and_paging(self, backend: Any) -> None:
+        bridge = Bridge(Memory(namespace="dashboard", backend=backend))
+        backend.save_candidate(_make_candidate(id="fact", candidate_type="Fact"))
+        backend.save_candidate(_make_candidate(id="task", candidate_type="Task"))
+        now = _now()
+        backend.save_atom(
+            _make_atom(
+                id="older-high",
+                candidate_id="fact",
+                assertion="rankmarker",
+                occurred_at=now,
+                created_at=now - timedelta(days=1),
+            )
+        )
+        backend.save_atom(
+            _make_atom(
+                id="newer-medium",
+                candidate_id="fact",
+                assertion="rankmarker rankmarker rankmarker",
+                importance="medium",
+                confidence="low",
+                occurred_at=now - timedelta(days=40),
+                created_at=now,
+            )
+        )
+        for atom in (
+            _make_atom(id="wrong-entity", candidate_id="fact", entity_id="ent-2", assertion="rankmarker"),
+            _make_atom(id="wrong-type", candidate_id="task", assertion="rankmarker"),
+            _make_atom(id="low-importance", candidate_id="fact", assertion="rankmarker", importance="low"),
+            _make_atom(id="deprecated", candidate_id="fact", assertion="rankmarker", deprecated_at=now),
+        ):
+            backend.save_atom(atom)
+
+        assert backend.search_atoms("rankmarker", entity_id="ent-1", limit=1)[0].id == "newer-medium"
+        filters = {"query": "rankmarker", "entity_id": "ent-1", "candidate_type": "Fact", "importance_min": "medium"}
+        result = self._list_atoms(bridge, **filters, limit=1)
+        assert [(atom["id"], atom["kind"]) for atom in result["items"]] == [("older-high", "Fact")]
+        assert result["total"] == 2
+        assert result["has_more"] is True
+
+        second = self._list_atoms(bridge, **filters, limit=1, offset=1)
+        assert [atom["id"] for atom in second["items"]] == ["newer-medium"]
+        assert second["has_more"] is False
+        explicit = self._list_atoms(bridge, **filters, order_by="created_at", order="desc")
+        assert [atom["id"] for atom in explicit["items"]] == ["newer-medium", "older-high"]
+        with_deprecated = self._list_atoms(bridge, **filters, include_deprecated=True)
+        assert {atom["id"] for atom in with_deprecated["items"]} == {"older-high", "newer-medium", "deprecated"}
+
+
+def test_postgres_atom_fts_upgrade_reindexes_existing_rows(postgres_dsn: str) -> None:
+    from octop_memory.storage.backends.postgres import PostgresMemoryBackend
+
+    namespace = f"atom_fts_upgrade_{uuid.uuid4().hex[:12]}"
+    original = PostgresMemoryBackend(namespace=namespace, dsn=postgres_dsn)
+    try:
+        original.save_atom(_make_atom(id="old-atom", assertion="喜欢喝美式咖啡"))
+        with original._cursor() as cur:
+            cur.execute("""
+                ALTER TABLE atoms
+                    DROP COLUMN fts_tsv,
+                    ADD COLUMN fts_tsv TSVECTOR GENERATED ALWAYS AS (
+                        to_tsvector(
+                            'simple',
+                            assertion || ' ' || verbatim_quote || ' ' ||
+                            COALESCE(jsonb_path_query_array(search_terms, '$[*]')::text, '')
+                        )
+                    ) STORED
+            """)
+            cur.execute("CREATE INDEX atoms_fts ON atoms USING GIN (fts_tsv)")
+            cur.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+        assert original.search_atoms("美式") == []
+
+        for _ in range(2):
+            reopened = PostgresMemoryBackend(namespace=namespace, dsn=postgres_dsn)
+            try:
+                assert [atom.id for atom in reopened.search_atoms("美式")] == ["old-atom"]
+                with reopened._cursor() as cur:
+                    cur.execute("SELECT COALESCE(to_regclass('atoms_fts_ns'), to_regclass('atoms_fts')) AS indexed")
+                    assert cur.fetchone()["indexed"] in {"atoms_fts_ns", "atoms_fts"}
+            finally:
+                reopened.close()
+    finally:
+        original.purge_namespace()
+        original.close()
+
+
 class TestAtomParity:
     def test_round_trip(self, backend: Any) -> None:
         backend.save_atom(_make_atom())
@@ -1131,6 +1246,20 @@ class TestAtomParity:
         assert {a.id for a in backend.search_atoms("zzmarker")} == {"a2"}
         both = backend.search_atoms("zzmarker", include_deprecated=True)
         assert {a.id for a in both} == {"a1", "a2"}
+
+    def test_search_matches_adjacent_chinese_characters_across_indexed_fields(self, backend: Any) -> None:
+        backend.save_atom(_make_atom(id="assertion", assertion="喜欢喝美式咖啡"))
+        backend.save_atom(_make_atom(id="quote", verbatim_quote="喜欢喝美式咖啡"))
+        backend.save_atom(_make_atom(id="terms", search_terms=["美式咖啡"]))
+        backend.save_atom(_make_atom(id="nonmatch", assertion="美味的卡式咖啡"))
+
+        assert {atom.id for atom in backend.search_atoms("美式")} == {"assertion", "quote", "terms"}
+
+    def test_tree_search_matches_adjacent_chinese_characters_from_atom(self, backend: Any) -> None:
+        memory = Memory(namespace="atom_tree", backend=backend)
+        leaf = memory.store("喜欢喝美式咖啡", topic="coffee")
+
+        assert [hit.atom_id for hit in memory.recall("美式")] == [leaf.atom_id]
 
     def test_find_by_signature(self, backend: Any) -> None:
         atom = _make_atom()

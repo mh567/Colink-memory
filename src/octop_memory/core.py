@@ -539,6 +539,29 @@ class Memory(_CheckpointerBase):  # type: ignore[misc]
         )
         return True
 
+    def atom_forget_ids(self, atom_id: str) -> tuple[str, ...]:
+        """Return the target and known historical predecessors, or empty if absent.
+
+        Hosts with backups should retain these IDs outside their backup and
+        replay :meth:`forget_atom` for each ID after a restore. Serialize
+        this lookup and the subsequent forget against other memory writers.
+        """
+        return self._backend.atom_forget_ids(atom_id)
+
+    def forget_atom(self, atom_id: str) -> bool:
+        """Hard-delete an atom and its predecessors from canonical memory.
+
+        Remove linked provenance and invalidate derived summaries. Other
+        atoms keep their assertions, even when their provenance was shared.
+        Returns ``False`` if the requested atom is missing.
+        """
+        with self._backend.transaction():
+            removed = self._backend.forget_atom(atom_id)
+            if self._vector_index is not None:
+                for removed_id in removed:
+                    self._vector_index.delete(removed_id)
+        return bool(removed)
+
     def create_atom(
         self,
         assertion: str,
@@ -667,11 +690,10 @@ class Memory(_CheckpointerBase):  # type: ignore[misc]
         self._index_atom_vector(atom)
         refreshed = self.get_entity(entity.id) or entity
         logger.info(
-            "memory.trigger create_atom ns=%s entity=%r atom=%s assertion=%r",
+            "memory.trigger create_atom ns=%s entity=%s atom=%s",
             self._namespace,
-            refreshed.canonical_name,
+            refreshed.id,
             atom.id,
-            text[:60],
         )
         return atom, refreshed, created_entity
 
@@ -765,9 +787,14 @@ class Memory(_CheckpointerBase):  # type: ignore[misc]
         self,
         query: str,
         *,
+        entity_id: str | None = None,
         include_deprecated: bool = False,
         limit: int = 10,
     ) -> list[AtomCard]:
+        if entity_id is not None:
+            return self._backend.search_atoms(
+                query, entity_id=entity_id, include_deprecated=include_deprecated, limit=limit
+            )
         return self._backend.search_atoms(query, include_deprecated=include_deprecated, limit=limit)
 
     def search_atoms_by_time_range(
@@ -1461,11 +1488,10 @@ class Memory(_CheckpointerBase):  # type: ignore[misc]
         # transaction; a failure here doesn't affect the relational data)
         self._index_atom_vector(atom)
         logger.info(
-            "memory.trigger store->atom ns=%s entity=%r atom=%s assertion=%r",
+            "memory.trigger store->atom ns=%s entity=%s atom=%s",
             self._namespace,
-            entity.canonical_name,
+            entity.id,
             atom.id,
-            content[:60],
         )
         return leaf
 

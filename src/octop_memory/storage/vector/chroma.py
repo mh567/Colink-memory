@@ -148,10 +148,7 @@ class ChromaVectorIndex:
         """Delete a single vector record."""
         if self._collection is None:
             return
-        try:
-            self._collection.delete(ids=[atom_id])
-        except VECTOR_ERRORS:
-            logger.warning("chroma delete failed for %s", atom_id, exc_info=True)
+        self._collection.delete(ids=[atom_id])
 
     # ------------------------------------------------------------------
     # Convenience properties

@@ -61,7 +61,7 @@
 ## 快速开始
 
 ```bash
-pip install octop-memory
+pip install colink-memory
 ```
 
 当前版本：**1.0.3**。更新内容见[发布说明](CHANGELOG.md)。
@@ -106,6 +106,8 @@ memory = Memory(
 ```
 
 实际凭据从部署配置注入。SQLite 使用 namespace 表名前缀；PostgreSQL 在共享 `octop_memory` schema 中使用 namespace-first key/index 隔离。
+
+PostgreSQL 升级中文 Atom 查询时，首次打开会重建共享 Atom 全文索引。迁移只执行一次，期间会独占锁定 Atom 表；数据量大时请安排维护窗口。
 
 同一进程、相同连接配置的 PostgreSQL 实例共享业务池（最多 8 条连接）及 checkpoint/维护池（最多 4 条），不随 agent 数量增加。每池最多等待 30 秒、最多排队 64 个请求；池满超时或队列已满会明确报错。空闲池可收缩到 0，关闭一个实例不会影响其它实例。多进程、不同连接配置及宿主自身数据库连接需要另计容量。
 

@@ -62,7 +62,7 @@ Existing installations should read the [rename migration guide](docs/integration
 ## Quick start
 
 ```bash
-pip install octop-memory
+pip install colink-memory
 ```
 
 Current release: **1.0.3**. See the [release notes](CHANGELOG.md).
@@ -107,6 +107,8 @@ memory = Memory(
 ```
 
 Use deployment configuration for real credentials. SQLite isolates memory with table prefixes; PostgreSQL uses namespace-first keys in the shared `octop_memory` schema.
+
+The PostgreSQL upgrade for Chinese Atom search rebuilds the shared Atom full-text index on first open. Plan a maintenance window for large stores: the one-time migration takes an exclusive lock on the Atom table.
 
 Within one process, PostgreSQL instances with the same connection settings share a business pool (up to 8 connections) and a checkpoint/maintenance pool (up to 4), independent of agent count. Each pool allows at most 64 queued requests with a 30-second checkout timeout; saturation raises an explicit error. Idle pools can shrink to zero, and closing one instance leaves other instances usable. Budget separately for multiple processes, different connection settings, and the host's own database connections.
 
